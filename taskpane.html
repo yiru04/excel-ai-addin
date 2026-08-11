@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<title>CGU AI 分析助手</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    margin: 0; padding: 12px;
+    color: #1a1a1a;
+    font-size: 14px;
+  }
+  h2 { font-size: 16px; margin: 0 0 2px 0; }
+  .sub { color: #666; font-size: 12px; margin-bottom: 12px; }
+
+  .key-row { margin-bottom: 10px; display: flex; gap: 6px; align-items: center; }
+  .key-row input[type=password] {
+    flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 6px;
+  }
+  .key-row button { padding: 6px 10px; border-radius: 6px; border: 1px solid #ccc; background: #f0f0f0; cursor: pointer; }
+  .key-status { font-size: 12px; margin-bottom: 8px; }
+  .key-status.ok { color: #0a7c3f; }
+  .key-status.bad { color: #b00020; }
+
+  .auto-approve-row { font-size: 12px; margin-bottom: 8px; color: #555; }
+
+  #chatBox {
+    border: 1px solid #ddd; border-radius: 8px;
+    height: calc(100vh - 260px); min-height: 240px;
+    overflow-y: auto; padding: 10px; margin-bottom: 8px; background: #fafafa;
+  }
+  .msg { margin-bottom: 10px; max-width: 92%; }
+  .msg .bubble {
+    padding: 8px 12px; border-radius: 10px; display: inline-block;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user { text-align: right; margin-left: auto; }
+  .msg.user .bubble { background: #0a7cff; color: white; }
+  .msg.ai .bubble { background: #e9e9eb; color: #1a1a1a; }
+  .msg.system .bubble { background: #fff3cd; color: #7a5c00; font-size: 12px; }
+  .msg.tool .bubble { background: #eef7ff; color: #0a4a8a; font-size: 12px; font-family: monospace; }
+
+  .input-row { display: flex; gap: 6px; }
+  .input-row textarea {
+    flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 6px;
+    resize: none; font-family: inherit; font-size: 14px;
+  }
+  .input-row button {
+    padding: 0 14px; border: none; border-radius: 6px; background: #0a7cff;
+    color: white; cursor: pointer; font-size: 14px;
+  }
+  .input-row button:disabled { background: #aac9f2; cursor: not-allowed; }
+
+  .footer-note { font-size: 11px; color: #999; margin-top: 6px; }
+  .reset-link { font-size: 12px; color: #0a7cff; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+  <h2>CGU AI 分析助手</h2>
+  <div class="sub">串接 Bloomberg 資料，可用自然語言查詢與分析</div>
+
+  <div class="key-row">
+    <input type="password" id="apiKey" placeholder="貼上你的 CGU API Key（sk-...）" />
+    <button onclick="testKey()">測試</button>
+  </div>
+  <div id="keyStatus" class="key-status"></div>
+
+  <div class="auto-approve-row">
+    <label>
+      <input type="checkbox" id="autoApproveReads" />
+      本次工作階段自動允許彭博資料查詢（不逐次跳確認視窗；寫入儲存格仍會詢問）
+    </label>
+  </div>
+
+  <div id="chatBox"></div>
+
+  <div class="input-row">
+    <textarea id="userInput" rows="2" placeholder="例如：幫我分析台積電的選擇權"></textarea>
+    <button id="sendBtn" onclick="sendMessage()">送出</button>
+  </div>
+  <div class="footer-note">
+    Enter 送出，Shift+Enter 換行 ｜ <span class="reset-link" onclick="resetConversation()">開新對話</span>
+  </div>
+
+<script>
+  // ============================================================
+  // 狀態
+  // ============================================================
+  let previousResponseId = null;
+  const SCRATCH_SHEET = "AI_Scratch";
+  let scratchRow = 1; // 每次寫入 Bloomberg 公式都往下一列，避免互相覆蓋
+
+  const CGU_URL = "https://air.cgu.edu.tw/cgullmapi/v1/responses";
+  const MODEL = "gpt-5.4-mini";
+
+  const SYSTEM_INSTRUCTIONS =
+    "你是嵌入在 Excel 裡的財務分析助手，服務對象是財務工程課程的學生。" +
+    "使用者的問題可能需要查詢 Bloomberg 即時或歷史資料才能回答，" +
+    "遇到這種情況請務必呼叫對應的工具取得真實資料，不要憑猜測回答。" +
+    "所有回覆一律使用繁體中文，語氣專業但易懂，適合財金系學生閱讀。" +
+    "分析選擇權、期貨等衍生性商品時，請簡要說明數字背後的意義，不要只丟數字。";
+
+  // ============================================================
+  // 工具定義（給模型看的 schema）
+  // ============================================================
+  const TOOLS = [
+    {
+      type: "function",
+      name: "get_bloomberg_field",
+      description: "查詢單一證券的單一即時或最新欄位資料（對應 Bloomberg BDP 函數）。適合查股價、成交量、隱含波動率等單一數值。",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string", description: "Bloomberg 代碼，例如 2330 TT Equity、TXO C202609 22000 Index" },
+          field: { type: "string", description: "Bloomberg 欄位代碼，例如 PX_LAST、VOLUME、IVOL_MID" }
+        },
+        required: ["ticker", "field"]
+      }
+    },
+    {
+      type: "function",
+      name: "get_bloomberg_history",
+      description: "查詢單一證券單一欄位的歷史時間序列（對應 Bloomberg BDH 函數）。",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string", description: "Bloomberg 代碼" },
+          field: { type: "string", description: "Bloomberg 欄位代碼，例如 PX_LAST" },
+          start_date: { type: "string", description: "起始日期，格式 YYYYMMDD" },
+          end_date: { type: "string", description: "結束日期，格式 YYYYMMDD" }
+        },
+        required: ["ticker", "field", "start_date", "end_date"]
+      }
+    },
+    {
+      type: "function",
+      name: "get_bloomberg_bulk",
+      description: "查詢會回傳多列資料的 Bloomberg 欄位（對應 BDS 函數），例如選擇權鏈 OPT_CHAIN、成分股清單等。",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string", description: "Bloomberg 代碼" },
+          field: { type: "string", description: "Bloomberg 批次欄位代碼，例如 OPT_CHAIN" }
+        },
+        required: ["ticker", "field"]
+      }
+    },
+    {
+      type: "function",
+      name: "read_range",
+      description: "讀取目前作用中工作表裡，使用者既有的儲存格內容（例如使用者自己先前用 BDP/BDH 抓好的資料）。",
+      parameters: {
+        type: "object",
+        properties: {
+          range_address: { type: "string", description: "A1 表示法的範圍，例如 A1:C10" }
+        },
+        required: ["range_address"]
+      }
+    },
+    {
+      type: "function",
+      name: "write_to_cell",
+      description: "把分析結果或數值寫入使用者目前作用中工作表的指定儲存格。這個動作會修改使用者的表格，執行前一定會先跳出確認視窗。",
+      parameters: {
+        type: "object",
+        properties: {
+          cell_address: { type: "string", description: "A1 表示法的儲存格，例如 F5" },
+          value: { type: "string", description: "要寫入的內容，可以是文字、數字，或以 = 開頭的公式" }
+        },
+        required: ["cell_address", "value"]
+      }
+    }
+  ];
+
+  // ============================================================
+  // UI 輔助
+  // ============================================================
+  const chatBox = document.getElementById('chatBox');
+  const userInput = document.getElementById('userInput');
+  const sendBtn = document.getElementById('sendBtn');
+
+  function addMessage(role, text) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    div.appendChild(bubble);
+    chatBox.appendChild(div);
+    chatBox.scrollTop = chatBox.scrollHeight;
+    return div;
+  }
+
+  function resetConversation() {
+    previousResponseId = null;
+    chatBox.innerHTML = '';
+    addMessage('system', '已開新對話。');
+  }
+
+  userInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  async function testKey() {
+    const key = document.getElementById('apiKey').value.trim();
+    const statusDiv = document.getElementById('keyStatus');
+    if (!key) { statusDiv.textContent = ''; return; }
+    statusDiv.className = 'key-status';
+    statusDiv.textContent = '測試中...';
+    try {
+      const resp = await fetch(CGU_URL, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: MODEL, input: '回覆「ok」兩個字即可', max_output_tokens: 20 })
+      });
+      if (resp.ok) {
+        statusDiv.className = 'key-status ok';
+        statusDiv.textContent = '✓ 金鑰可用';
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        statusDiv.className = 'key-status bad';
+        statusDiv.textContent = '✗ ' + (data.error ? data.error.message : ('HTTP ' + resp.status));
+      }
+    } catch (e) {
+      statusDiv.className = 'key-status bad';
+      statusDiv.textContent = '✗ 連線失敗：' + e.message;
+    }
+  }
+
+  // ============================================================
+  // Bloomberg 工具實作（透過 Excel.run 寫公式、輪詢讀值）
+  // ============================================================
+
+  async function getScratchSheet(context) {
+    const sheets = context.workbook.worksheets;
+    sheets.load("items/name");
+    await context.sync();
+    let sheet = sheets.items.find(s => s.name === SCRATCH_SHEET);
+    if (!sheet) {
+      sheet = sheets.add(SCRATCH_SHEET);
+      await context.sync();
+    }
+    return context.workbook.worksheets.getItem(SCRATCH_SHEET);
+  }
+
+  // 等待 Bloomberg 把資料算出來（剛寫入公式時通常會顯示 Requesting Data...）
+  async function waitForValue(context, range, timeoutMs = 8000, intervalMs = 400) {
+    const start = Date.now();
+    let lastText = "";
+    while (Date.now() - start < timeoutMs) {
+      range.load("values,text");
+      await context.sync();
+      lastText = range.values;
+      const flat = JSON.stringify(lastText);
+      if (!flat.includes("Requesting") && !flat.includes("#N/A Requesting")) {
+        return lastText;
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    return lastText; // 逾時就回傳目前拿到的值，讓上層自行判斷
+  }
+
+  async function toolGetBloombergField(args) {
+    return Excel.run(async (context) => {
+      const sheet = await getScratchSheet(context);
+      const row = scratchRow++;
+      const cell = sheet.getRange(`A${row}`);
+      cell.formulas = [[`=BDP("${args.ticker}","${args.field}")`]];
+      await context.sync();
+      const value = await waitForValue(context, cell);
+      return { ticker: args.ticker, field: args.field, value: value[0][0] };
+    });
+  }
+
+  async function toolGetBloombergHistory(args) {
+    return Excel.run(async (context) => {
+      const sheet = await getScratchSheet(context);
+      const row = scratchRow;
+      scratchRow += 60; // 預留空間給展開的歷史資料，避免下一次呼叫覆蓋到
+      const cell = sheet.getRange(`A${row}`);
+      cell.formulas = [[`=BDH("${args.ticker}","${args.field}","${args.start_date}","${args.end_date}")`]];
+      await context.sync();
+
+      // 讀一個較大的範圍把 spill 出來的資料整個包住
+      const resultRange = sheet.getRange(`A${row}:B${row + 55}`);
+      const values = await waitForValue(context, resultRange, 10000);
+
+      const rows = values.filter(r => r[0] !== "" && r[0] !== null);
+      return { ticker: args.ticker, field: args.field, rows: rows };
+    });
+  }
+
+  async function toolGetBloombergBulk(args) {
+    return Excel.run(async (context) => {
+      const sheet = await getScratchSheet(context);
+      const row = scratchRow;
+      scratchRow += 200; // 選擇權鏈這類資料可能列數很多，多留一點空間
+      const cell = sheet.getRange(`A${row}`);
+      cell.formulas = [[`=BDS("${args.ticker}","${args.field}")`]];
+      await context.sync();
+
+      const resultRange = sheet.getRange(`A${row}:J${row + 195}`);
+      const values = await waitForValue(context, resultRange, 12000);
+
+      const rows = values.filter(r => r.some(v => v !== "" && v !== null));
+      return { ticker: args.ticker, field: args.field, row_count: rows.length, rows: rows.slice(0, 50) };
+      // 只回傳前 50 列給模型，避免一次塞爆 token；完整資料仍留在 AI_Scratch 工作表裡
+    });
+  }
+
+  async function toolReadRange(args) {
+    return Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      const range = sheet.getRange(args.range_address);
+      range.load("values");
+      await context.sync();
+      return { range: args.range_address, values: range.values };
+    });
+  }
+
+  async function toolWriteToCell(args) {
+    const confirmed = window.confirm(
+      `AI 想要把以下內容寫入目前工作表的 ${args.cell_address} 格：\n\n${args.value}\n\n允許嗎？`
+    );
+    if (!confirmed) {
+      return { written: false, reason: "使用者取消了這次寫入" };
+    }
+    return Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      const cell = sheet.getRange(args.cell_address);
+      if (args.value.startsWith("=")) {
+        cell.formulas = [[args.value]];
+      } else {
+        cell.values = [[args.value]];
+      }
+      await context.sync();
+      return { written: true, cell_address: args.cell_address };
+    });
+  }
+
+  function needsApproval(toolName) {
+    if (toolName === "write_to_cell") return true; // 一律要確認，跟自動允許開關無關
+    if (toolName === "read_range") return false; // 唯讀既有資料，風險低
+    // Bloomberg 查詢類：看使用者有沒有勾選自動允許
+    return !document.getElementById('autoApproveReads').checked;
+  }
+
+  function describeToolCall(name, args) {
+    switch (name) {
+      case "get_bloomberg_field":
+        return `查詢 Bloomberg：${args.ticker} 的 ${args.field}`;
+      case "get_bloomberg_history":
+        return `查詢 Bloomberg 歷史資料：${args.ticker} 的 ${args.field}（${args.start_date} ~ ${args.end_date}）`;
+      case "get_bloomberg_bulk":
+        return `查詢 Bloomberg 批次資料：${args.ticker} 的 ${args.field}`;
+      case "read_range":
+        return `讀取工作表範圍：${args.range_address}`;
+      case "write_to_cell":
+        return `寫入儲存格 ${args.cell_address}`;
+      default:
+        return name;
+    }
+  }
+
+  async function executeTool(name, args) {
+    if (needsApproval(name) && name !== "write_to_cell") {
+      // write_to_cell 自己內部已經有更詳細的確認視窗，這裡不重複問
+      const confirmed = window.confirm(`AI 想要執行：\n\n${describeToolCall(name, args)}\n\n允許嗎？`);
+      if (!confirmed) {
+        return { error: "使用者取消了這次查詢" };
+      }
+    }
+
+    switch (name) {
+      case "get_bloomberg_field": return toolGetBloombergField(args);
+      case "get_bloomberg_history": return toolGetBloombergHistory(args);
+      case "get_bloomberg_bulk": return toolGetBloombergBulk(args);
+      case "read_range": return toolReadRange(args);
+      case "write_to_cell": return toolWriteToCell(args);
+      default: return { error: `未知的工具：${name}` };
+    }
+  }
+
+  // ============================================================
+  // 核心：多輪工具呼叫迴圈
+  // ============================================================
+  async function callModel(payload) {
+    const key = document.getElementById('apiKey').value.trim();
+    const resp = await fetch(CGU_URL, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error ? data.error.message : ('HTTP ' + resp.status));
+    }
+    return data;
+  }
+
+  async function sendMessage() {
+    const key = document.getElementById('apiKey').value.trim();
+    const text = userInput.value.trim();
+    if (!key) { addMessage('system', '請先在上面輸入你的 CGU API Key'); return; }
+    if (!text) return;
+
+    addMessage('user', text);
+    userInput.value = '';
+    sendBtn.disabled = true;
+
+    const thinking = addMessage('system', '思考中...');
+
+    try {
+      let payload = {
+        model: MODEL,
+        input: text,
+        instructions: previousResponseId ? undefined : SYSTEM_INSTRUCTIONS,
+        tools: TOOLS,
+        max_output_tokens: 800
+      };
+      if (previousResponseId) payload.previous_response_id = previousResponseId;
+
+      // 最多循環 6 輪工具呼叫，避免模型卡在無窮迴圈裡
+      for (let round = 0; round < 6; round++) {
+        const data = await callModel(payload);
+        previousResponseId = data.id;
+
+        const functionCalls = (data.output || []).filter(i => i.type === "function_call");
+        const messages = (data.output || []).filter(i => i.type === "message");
+
+        if (functionCalls.length === 0) {
+          // 沒有工具呼叫了，代表模型給出最終答案
+          thinking.remove();
+          let replyText = "(沒有收到文字回覆)";
+          for (const m of messages) {
+            for (const c of (m.content || [])) {
+              if (c.type === "output_text") replyText = c.text;
+            }
+          }
+          addMessage('ai', replyText);
+          return;
+        }
+
+        // 執行模型要求的每一個工具呼叫
+        const toolOutputs = [];
+        for (const fc of functionCalls) {
+          const args = JSON.parse(fc.arguments || "{}");
+          thinking.querySelector('.bubble').textContent =
+            '執行中：' + describeToolCall(fc.name, args) + ' ...';
+          let result;
+          try {
+            result = await executeTool(fc.name, args);
+          } catch (e) {
+            result = { error: e.message };
+          }
+          addMessage('tool', describeToolCall(fc.name, args) + '\n→ ' + JSON.stringify(result).slice(0, 300));
+          toolOutputs.push({
+            type: "function_call_output",
+            call_id: fc.call_id,
+            output: JSON.stringify(result)
+          });
+        }
+
+        // 把工具結果餵回去，準備下一輪
+        payload = {
+          model: MODEL,
+          previous_response_id: previousResponseId,
+          input: toolOutputs,
+          tools: TOOLS,
+          max_output_tokens: 800
+        };
+      }
+
+      thinking.remove();
+      addMessage('system', '工具呼叫次數超過上限，已停止。可以換個更明確的問題再試一次。');
+
+    } catch (e) {
+      thinking.remove();
+      addMessage('system', '發生錯誤：' + e.message);
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  Office.onReady(() => {
+    addMessage('system', 'Add-in 已載入。請先貼上你的 CGU API Key，就可以開始提問了。');
+  });
+</script>
+</body>
+</html>
